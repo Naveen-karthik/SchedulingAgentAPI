@@ -1,0 +1,4 @@
+assignment_id,type,location,required_skill,priority,due_date,estimated_duration_hours
+INS-1001,Roof Inspection,"Jacksonville, FL",Roof Inspection,High,2026-05-10,2
+INS-1002,Drone Inspection,"Orlando, FL",Drone License,Medium,2026-05-11,3
+INS-1003,Commercial Roof Inspection,"Miami, FL",Commercial Inspection,High,2026-05-09,4

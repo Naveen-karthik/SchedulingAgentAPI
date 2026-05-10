@@ -1,0 +1,4 @@
+producer_id,name,location,skills,available_from,available_to,current_workload,travel_limit_miles
+PRD-201,Michael Rivera,"Jacksonville, FL","Roof Inspection,Underwriting Inspection",2026-05-09,2026-05-11,2,120
+PRD-202,Sarah Thompson,"Orlando, FL","Drone License,Interior Inspection",2026-05-10,2026-05-12,1,150
+PRD-203,Jessica Alvarez,"Fort Lauderdale, FL","Commercial Inspection,Roof Inspection",2026-05-09,2026-05-10,3,60
