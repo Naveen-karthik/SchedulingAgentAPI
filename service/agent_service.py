@@ -1,3 +1,9 @@
+"""
+Scheduling Agent Service
+Handles: data loading, eligibility validation, producer ranking, assignment, conflict detection,
+         negative scenario detection and reporting
+"""
+
 import csv
 import os
 from datetime import datetime, date
@@ -20,12 +26,10 @@ CITY_COORDS = {
 def haversine_miles(loc1: str, loc2: str) -> float:
     """Return distance in miles between two city name strings."""
     if loc1 not in CITY_COORDS or loc2 not in CITY_COORDS:
-        return 9999.0  # unknown → treat as very far
-
+        return 9999.0
     lat1, lon1 = CITY_COORDS[loc1]
     lat2, lon2 = CITY_COORDS[loc2]
-
-    R = 3958.8  # Earth radius in miles
+    R = 3958.8
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
@@ -41,10 +45,11 @@ DATASET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "da
 
 
 def load_assignments(filepath: Optional[str] = None) -> list[dict]:
-    """Load assignments from CSV and parse types."""
-    path = filepath or os.path.join(DATASET_DIR, "assignments.csv")
+    # ── Switch between datasets here ──────────────────────────────────────────
+    path = filepath or os.path.join(DATASET_DIR, "assignments.csv")                     # Normal data (active)
+    # path = filepath or os.path.join(DATASET_DIR, "negative_assignments.csv")          # Negative test data
+    # ──────────────────────────────────────────────────────────────────────────
     assignments = []
-
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -57,15 +62,12 @@ def load_assignments(filepath: Optional[str] = None) -> list[dict]:
                 "due_date": datetime.strptime(row["due_date"].strip(), "%Y-%m-%d").date(),
                 "estimated_duration_hours": int(row["estimated_duration_hours"].strip()),
             })
-
     return assignments
 
 
 def load_producers(filepath: Optional[str] = None) -> list[dict]:
-    """Load producers from CSV and parse types."""
     path = filepath or os.path.join(DATASET_DIR, "producers.csv")
     producers = []
-
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -80,7 +82,6 @@ def load_producers(filepath: Optional[str] = None) -> list[dict]:
                 "current_workload": int(row["current_workload"].strip()),
                 "travel_limit_miles": int(row["travel_limit_miles"].strip()),
             })
-
     return producers
 
 
@@ -89,17 +90,13 @@ def load_producers(filepath: Optional[str] = None) -> list[dict]:
 # ─────────────────────────────────────────────────────────
 
 def validate_producer_eligibility(producer: dict, assignment: dict) -> tuple[bool, list[str]]:
-    """
-    Returns (is_eligible, list_of_reasons).
-    All hard constraints must pass for eligibility.
-    """
     reasons = []
 
     # 1. Skill match
     if assignment["required_skill"] not in producer["skills"]:
         reasons.append(f"Missing required skill '{assignment['required_skill']}'")
 
-    # 2. Availability — producer must be available on or before due date
+    # 2. Availability
     if not (producer["available_from"] <= assignment["due_date"] <= producer["available_to"]):
         reasons.append(
             f"Not available on due date {assignment['due_date']} "
@@ -122,28 +119,12 @@ def validate_producer_eligibility(producer: dict, assignment: dict) -> tuple[boo
 # ─────────────────────────────────────────────────────────
 
 def score_producer(producer: dict, assignment: dict) -> float:
-    """
-    Higher score = better match.
-
-    Scoring factors:
-      - Distance:  100 pts if same city, scales down with distance
-      - Workload:  30 pts for workload=0, 0 pts for workload=5+
-      - Availability window overlap: up to 20 pts
-    """
     distance = haversine_miles(producer["location"], assignment["location"])
-
-    # Distance score: 100 if same city (< 5 mi), drops as distance grows
     distance_score = max(0, 100 - distance)
-
-    # Workload score: fewer assignments = better (max 5 workload considered)
     workload_score = max(0, (5 - producer["current_workload"]) / 5) * 30
-
-    # Availability score: how many days available around the due date
     available_days = (producer["available_to"] - producer["available_from"]).days + 1
     availability_score = min(available_days / 3, 1) * 20
-
-    total = distance_score + workload_score + availability_score
-    return round(total, 2)
+    return round(distance_score + workload_score + availability_score, 2)
 
 
 # ─────────────────────────────────────────────────────────
@@ -155,10 +136,6 @@ def check_conflict(
     assignment: dict,
     confirmed_schedule: list[dict]
 ) -> tuple[bool, Optional[str]]:
-    """
-    Check if a producer is double-booked on the same due date.
-    Returns (has_conflict, conflicting_assignment_id or None).
-    """
     for entry in confirmed_schedule:
         if (
             entry["producer_id"] == producer_id
@@ -169,6 +146,148 @@ def check_conflict(
 
 
 # ─────────────────────────────────────────────────────────
+# Negative Scenario Detector
+# ─────────────────────────────────────────────────────────
+
+def detect_negative_scenarios(assignments: list[dict], producers: list[dict]) -> list[dict]:
+    """
+    Scans all assignments and producers BEFORE scheduling.
+    Identifies every negative pattern and explains exactly why it is a problem.
+
+    Negative patterns detected:
+      1. NO_SKILL_MATCH       — No producer has the required skill
+      2. NO_AVAILABILITY      — No producer is available on the due date
+      3. TRAVEL_LIMIT_BREACH  — All skilled producers are too far away
+      4. OVERLOADED_PRODUCER  — Only available producer has workload >= 5
+      5. PAST_DUE_DATE        — Assignment due date has already passed
+      6. UNKNOWN_LOCATION     — Assignment location not in our city map
+    """
+    today = date.today()
+    negative_scenarios = []
+
+    for assignment in assignments:
+        aid = assignment["assignment_id"]
+        flags = []
+
+        # ── Pattern 1: Past due date ──────────────────────
+        if assignment["due_date"] < today:
+            flags.append({
+                "pattern": "PAST_DUE_DATE",
+                "description": (
+                    f"Assignment due date {assignment['due_date']} has already passed "
+                    f"(today is {today}). This job cannot be scheduled on time."
+                ),
+                "recommendation": "Re-negotiate the due date or mark as overdue."
+            })
+
+        # ── Pattern 2: Unknown location ───────────────────
+        if assignment["location"] not in CITY_COORDS:
+            flags.append({
+                "pattern": "UNKNOWN_LOCATION",
+                "description": (
+                    f"Location '{assignment['location']}' is not in the system's city map. "
+                    f"Distance calculations will be inaccurate."
+                ),
+                "recommendation": "Add the city coordinates to CITY_COORDS in the service."
+            })
+
+        # ── Per-producer checks ───────────────────────────
+        skilled_producers = [
+            p for p in producers
+            if assignment["required_skill"] in p["skills"]
+        ]
+
+        available_producers = [
+            p for p in skilled_producers
+            if p["available_from"] <= assignment["due_date"] <= p["available_to"]
+        ]
+
+        reachable_producers = [
+            p for p in skilled_producers
+            if haversine_miles(p["location"], assignment["location"]) <= p["travel_limit_miles"]
+        ]
+
+        # ── Pattern 3: No skill match ─────────────────────
+        if not skilled_producers:
+            flags.append({
+                "pattern": "NO_SKILL_MATCH",
+                "description": (
+                    f"No producer in the system has the required skill "
+                    f"'{assignment['required_skill']}'. "
+                    f"Available skills across all producers: "
+                    f"{list(set(s for p in producers for s in p['skills']))}."
+                ),
+                "recommendation": "Onboard a producer with this skill or outsource the job."
+            })
+
+        # ── Pattern 4: No availability ────────────────────
+        elif not available_producers:
+            unavailable_details = [
+                f"{p['name']} (available {p['available_from']} to {p['available_to']})"
+                for p in skilled_producers
+            ]
+            flags.append({
+                "pattern": "NO_AVAILABILITY",
+                "description": (
+                    f"Skilled producers exist but none are available on due date "
+                    f"{assignment['due_date']}. "
+                    f"Skilled producers: {unavailable_details}."
+                ),
+                "recommendation": "Extend producer availability or push the due date."
+            })
+
+        # ── Pattern 5: Travel limit breach ───────────────
+        if skilled_producers and not reachable_producers:
+            distance_details = [
+                f"{p['name']} is {haversine_miles(p['location'], assignment['location']):.0f} miles away (limit: {p['travel_limit_miles']} miles)"
+                for p in skilled_producers
+            ]
+            flags.append({
+                "pattern": "TRAVEL_LIMIT_BREACH",
+                "description": (
+                    f"Skilled producers exist but none can reach '{assignment['location']}' "
+                    f"within their travel limits. Details: {distance_details}."
+                ),
+                "recommendation": "Increase travel allowance or find a local producer."
+            })
+
+        # ── Pattern 6: Overloaded producers ──────────────
+        eligible_but_overloaded = [
+            p for p in producers
+            if assignment["required_skill"] in p["skills"]
+            and p["current_workload"] >= 5
+        ]
+        fully_eligible = [
+            p for p in producers
+            if assignment["required_skill"] in p["skills"]
+            and haversine_miles(p["location"], assignment["location"]) <= p["travel_limit_miles"]
+            and p["available_from"] <= assignment["due_date"] <= p["available_to"]
+        ]
+        if eligible_but_overloaded and not fully_eligible:
+            flags.append({
+                "pattern": "OVERLOADED_PRODUCER",
+                "description": (
+                    f"The only producers with the required skill are at maximum workload (5+). "
+                    f"Overloaded: {[p['name'] for p in eligible_but_overloaded]}."
+                ),
+                "recommendation": "Reduce existing assignments or bring in additional producers."
+            })
+
+        if flags:
+            negative_scenarios.append({
+                "assignment_id": aid,
+                "assignment_type": assignment["type"],
+                "location": assignment["location"],
+                "priority": assignment["priority"],
+                "due_date": str(assignment["due_date"]),
+                "negative_patterns_detected": len(flags),
+                "patterns": flags,
+            })
+
+    return negative_scenarios
+
+
+# ─────────────────────────────────────────────────────────
 # Core Scheduling Agent
 # ─────────────────────────────────────────────────────────
 
@@ -176,38 +295,32 @@ def run_scheduling_agent(
     assignments_path: Optional[str] = None,
     producers_path: Optional[str] = None,
 ) -> dict:
-    """
-    Main agent entry point.
-    Returns a structured result with scheduled, escalated, and conflict entries.
-    """
     assignments = load_assignments(assignments_path)
     producers = load_producers(producers_path)
 
-    # Step 1: Sort assignments — High priority first, then by due date (earliest first)
+    # ── Negative scenario analysis (runs before scheduling) ──
+    negative_scenarios = detect_negative_scenarios(assignments, producers)
+
+    # ── Sort: High priority first, then earliest due date ──
     priority_order = {"High": 0, "Medium": 1, "Low": 2}
     sorted_assignments = sorted(
         assignments,
         key=lambda a: (priority_order.get(a["priority"], 99), a["due_date"])
     )
 
-    confirmed_schedule: list[dict] = []  # tracks producer bookings for conflict detection
+    confirmed_schedule: list[dict] = []
     results = []
 
     for assignment in sorted_assignments:
         aid = assignment["assignment_id"]
         eligible_producers = []
 
-        # Step 2: Validate eligibility for each producer
         for producer in producers:
             is_eligible, fail_reasons = validate_producer_eligibility(producer, assignment)
             if is_eligible:
                 score = score_producer(producer, assignment)
-                eligible_producers.append({
-                    "producer": producer,
-                    "score": score,
-                })
+                eligible_producers.append({"producer": producer, "score": score})
 
-        # Step 3: No eligible producer → Escalate
         if not eligible_producers:
             results.append({
                 "assignment_id": aid,
@@ -219,20 +332,15 @@ def run_scheduling_agent(
             })
             continue
 
-        # Step 4: Sort eligible producers by score (highest first)
         eligible_producers.sort(key=lambda x: x["score"], reverse=True)
 
-        # Step 5: Pick best producer, respecting conflict check
         assigned = False
         for candidate in eligible_producers:
             p = candidate["producer"]
-            has_conflict, conflicting_id = check_conflict(
-                p["producer_id"], assignment, confirmed_schedule
-            )
+            has_conflict, conflicting_id = check_conflict(p["producer_id"], assignment, confirmed_schedule)
             if has_conflict:
-                continue  # skip — already booked that day
+                continue
 
-            # Book this producer
             confirmed_schedule.append({
                 "producer_id": p["producer_id"],
                 "assignment_id": aid,
@@ -258,7 +366,6 @@ def run_scheduling_agent(
             assigned = True
             break
 
-        # All eligible producers had conflicts → Escalate
         if not assigned:
             results.append({
                 "assignment_id": aid,
@@ -269,13 +376,22 @@ def run_scheduling_agent(
                 "score": None,
             })
 
-    # ── Summary ──────────────────────────────────────────
     scheduled = [r for r in results if r["decision"] == "Scheduled"]
     escalated = [r for r in results if r["decision"] == "Escalate"]
 
     return {
-        "total_assignments": len(assignments),
-        "scheduled_count": len(scheduled),
-        "escalated_count": len(escalated),
-        "schedule": results,
+        "summary": {
+            "total_assignments": len(assignments),
+            "scheduled_count": len(scheduled),
+            "escalated_count": len(escalated),
+        },
+        "negative_scenarios": {
+            "total_patterns_found": len(negative_scenarios),
+            "affected_assignments": [n["assignment_id"] for n in negative_scenarios],
+            "details": negative_scenarios,
+        },
+        "assignments": {
+            "scheduled": scheduled,
+            "escalated": escalated,
+        },
     }
